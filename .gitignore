@@ -1,0 +1,49 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+superset-venv/
+.env/
+.env.*
+
+# Distribution / packaging
+.Python
+build/
+dist/
+eggs/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Logs
+*.log
+logs/
+*.pid
+
+# VS Code
+.vscode/
+.history/
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Excel / Data Files (agar repo me nahi chahiye)
+*.xlsx
+*.csv
+
+# Environment variables
+.env
+.env.local
+
+# Superset specific (optional - agar runtime files generate hote hain)
+superset.db
+*.db
+
+# PM2
+.pm2/
