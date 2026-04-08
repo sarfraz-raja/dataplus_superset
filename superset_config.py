@@ -61,5 +61,6 @@ GUEST_TOKEN_JWT_SECRET = SECRET_KEY
 WTF_CSRF_ENABLED = False
 TALISMAN_ENABLED = False
 
+APP_NAME = "DataYog"
 APP_ICON = "/data/system/dataplus_superset/loading.cff8a5da.gif"
 APP_ICON_WIDTH = 126
