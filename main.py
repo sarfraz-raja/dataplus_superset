@@ -1,6 +1,25 @@
+import logging
+import os
+import re
+import threading
+import time
+import zipfile
+from pathlib import Path
+
 import requests
-from flask import Flask, jsonify, request, render_template
+from flask import Flask, jsonify, request, render_template, Response, send_file
 from flask_cors import CORS
+from PIL import Image
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+
+# =========================
+# LOGGING
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger(__name__)
 
 # =========================
 # CONFIG
@@ -16,6 +35,12 @@ SUPERSET_ADMIN_PASS = "admin123"
 
 FLASK_PORT = 8089
 
+UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
+SESSION_FILE = os.path.join(os.getcwd(), "superset_session.json")
+
+# Max retries for transient playwright failures
+EXPORT_MAX_RETRIES = 2
+
 # =========================
 # FLASK APP
 # =========================
@@ -30,12 +55,143 @@ CORS(
                 "http://127.0.0.1:5173",
                 "http://192.168.0.102:5173",
                 "http://192.168.0.100:5173",
-                
+                "http://192.168.0.181:5173",
+                "http://192.168.0.172:5173",
+                "http://dyserver:5173",
+                "http://dyserver2:5173",
             ]
         }
     },
     supports_credentials=True,
 )
+
+# =========================
+# BROWSER SINGLETON + WARM PAGE CACHE
+#
+# One browser + context is reused across all requests (avoids ~3s launch overhead).
+# Additionally, pages are kept alive after export and reused on the next request
+# for the same target URL. On a warm hit, only page.reload() is needed — the
+# browser's HTTP cache serves JS/CSS instantly; only chart data is re-fetched.
+# This saves ~3-5s on every repeat export of the same dashboard/chart.
+#
+# _warm_pages: { target_url -> playwright Page }  (max WARM_PAGE_LIMIT entries)
+# A threading.Lock serializes all Playwright calls (sync API is not thread-safe).
+# =========================
+_playwright = None
+_browser = None
+_browser_context = None
+_browser_lock = threading.Lock()
+
+WARM_PAGE_LIMIT = 3          # max open warm pages (memory guard)
+_warm_pages: dict = {}       # url -> Page
+_warm_page_order: list = []  # LRU order of urls
+
+
+def _get_browser_context():
+    """Return a reusable browser context, launching Playwright lazily."""
+    global _playwright, _browser, _browser_context
+
+    if _browser_context is not None:
+        return _browser_context
+
+    log.info("Launching Playwright browser (first time)...")
+    _playwright = sync_playwright().start()
+    _browser = _playwright.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--window-size=1920,1080",
+        ],
+    )
+
+    storage = SESSION_FILE if os.path.exists(SESSION_FILE) else None
+    if storage:
+        log.info("Loading saved browser session from %s", SESSION_FILE)
+
+    _browser_context = _browser.new_context(
+        accept_downloads=True,
+        viewport={"width": 1920, "height": 1080},
+        storage_state=storage,
+    )
+
+    return _browser_context
+
+
+def _reset_browser_context():
+    """Close and reset everything so the next call re-creates from scratch."""
+    global _browser, _browser_context, _playwright, _warm_pages, _warm_page_order
+
+    log.warning("Resetting browser context and warm page cache...")
+    _warm_pages = {}
+    _warm_page_order = []
+
+    try:
+        if _browser_context:
+            _browser_context.close()
+    except Exception:
+        pass
+    try:
+        if _browser:
+            _browser.close()
+    except Exception:
+        pass
+    try:
+        if _playwright:
+            _playwright.stop()
+    except Exception:
+        pass
+
+    _playwright = None
+    _browser = None
+    _browser_context = None
+
+
+def _get_warm_page(target_url):
+    """
+    Return a cached warm Page for target_url if one exists and is still alive.
+    Returns None if no warm page is available (cold path needed).
+    """
+    page = _warm_pages.get(target_url)
+    if page is None:
+        return None
+    try:
+        # Quick liveness check — if page was closed/crashed this raises
+        _ = page.url
+        log.info("Warm page hit for %s", target_url)
+        return page
+    except Exception:
+        _evict_warm_page(target_url)
+        return None
+
+
+def _store_warm_page(target_url, page):
+    """Store page in the warm cache, evicting LRU entry if limit is reached."""
+    global _warm_page_order
+
+    if target_url in _warm_pages:
+        _warm_page_order.remove(target_url)
+    elif len(_warm_pages) >= WARM_PAGE_LIMIT:
+        oldest = _warm_page_order.pop(0)
+        _evict_warm_page(oldest)
+
+    _warm_pages[target_url] = page
+    _warm_page_order.append(target_url)
+    log.info("Warm page stored for %s (cache size: %d)", target_url, len(_warm_pages))
+
+
+def _evict_warm_page(target_url):
+    """Close and remove a warm page from the cache."""
+    page = _warm_pages.pop(target_url, None)
+    if target_url in _warm_page_order:
+        _warm_page_order.remove(target_url)
+    if page:
+        try:
+            page.close()
+        except Exception:
+            pass
+
 
 # =========================
 # HELPERS
@@ -51,7 +207,6 @@ def is_superset_running():
 def superset_login():
     session = requests.Session()
 
-    # 1️⃣ Login
     r = session.post(
         SUPERSET_LOGIN_API,
         json={
@@ -65,18 +220,467 @@ def superset_login():
 
     access_token = r.json()["access_token"]
 
-    # 2️⃣ CSRF Token
     r = session.get(
         f"{SUPERSET_BASE}/api/v1/security/csrf_token/",
-        headers={
-            "Authorization": f"Bearer {access_token}"
-        },
+        headers={"Authorization": f"Bearer {access_token}"},
     )
     r.raise_for_status()
 
     csrf_token = r.json()["result"]
 
     return access_token, csrf_token, session
+
+
+def _validate_ids(dashboard_id, chart_id):
+    """
+    Check via Superset API that the given dashboard_id / chart_id actually exists.
+    Returns (True, None) if valid, or (False, error_message) if not found.
+    """
+    try:
+        access_token, _, _ = superset_login()
+        headers = {"Authorization": f"Bearer {access_token}"}
+
+        if dashboard_id:
+            r = requests.get(
+                f"{SUPERSET_BASE}/api/v1/dashboard/{dashboard_id}",
+                headers=headers,
+                timeout=10,
+            )
+            if r.status_code == 404:
+                return False, f"Dashboard with id {dashboard_id} not found"
+            if r.status_code != 200:
+                return False, f"Could not verify dashboard {dashboard_id} (status {r.status_code})"
+
+        if chart_id:
+            r = requests.get(
+                f"{SUPERSET_BASE}/api/v1/chart/{chart_id}",
+                headers=headers,
+                timeout=10,
+            )
+            if r.status_code == 404:
+                return False, f"Chart with id {chart_id} not found"
+            if r.status_code != 200:
+                return False, f"Could not verify chart {chart_id} (status {r.status_code})"
+
+    except Exception as e:
+        return False, f"Superset API check failed: {e}"
+
+    return True, None
+
+
+def _build_target_url(dashboard_id, chart_id):
+    """
+    Return the Superset URL to navigate to for export.
+    Chart takes priority over dashboard when both are provided.
+    standalone=3 hides the header/navbar so the browser renders less DOM,
+    which meaningfully cuts render time.
+    """
+    if chart_id:
+        return f"{SUPERSET_BASE}/explore/?slice_id={chart_id}"
+    # No standalone param — same URL as test.py which has working download menu
+    return f"{SUPERSET_BASE}/superset/dashboard/{dashboard_id}/"
+
+
+def _ensure_logged_in(page, context, target_url, theme="light"):
+    """
+    Navigate to target_url; login via form if redirected to /login.
+    Theme is applied via CSS media emulation (prefers-color-scheme) which is
+    what Superset/Ant Design actually reads — localStorage keys are unreliable
+    across Superset versions.
+    """
+    color_scheme = "dark" if theme == "dark" else "light"
+    page.emulate_media(color_scheme=color_scheme)
+
+    # domcontentloaded is enough to detect the login redirect; much faster than networkidle
+    page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
+
+    if "/login" in page.url:
+        log.info("Session expired or missing — logging in via browser UI...")
+
+        page.wait_for_selector("#username", timeout=30_000)
+        page.fill("#username", SUPERSET_ADMIN_USER)
+        page.fill("#password", SUPERSET_ADMIN_PASS)
+        page.locator("button[type='submit']").click()
+
+        # Wait for redirect away from /login instead of a fixed sleep
+        page.wait_for_url(lambda url: "/login" not in url, timeout=30_000)
+
+        page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
+
+        context.storage_state(path=SESSION_FILE)
+        log.info("Login successful. Session saved to %s", SESSION_FILE)
+    else:
+        log.info("Existing session valid.")
+
+
+def _get_tab_names(page) -> list:
+    """
+    Auto-detect all tab names on the dashboard.
+    Returns an empty list if the dashboard has no tabs.
+    """
+    try:
+        locator = page.locator("[role='tab']")
+        count = locator.count()
+        if count == 0:
+            return []
+        names = [n.strip() for n in locator.all_text_contents() if n.strip()]
+        log.info("Detected %d tab(s): %s", len(names), names)
+        return names
+    except Exception as e:
+        log.warning("Tab detection failed: %s", e)
+        return []
+
+
+def _select_tab(page, tab_name: str):
+    """
+    Click a dashboard tab by name and wait for its charts to finish loading.
+    """
+    log.info("Selecting tab: %s", tab_name)
+    try:
+        tab = page.get_by_role("tab", name=re.compile(re.escape(tab_name), re.IGNORECASE))
+        if tab.count() == 0:
+            tab = page.locator(".ant-tabs-tab, [role='tab']").filter(
+                has_text=re.compile(re.escape(tab_name), re.IGNORECASE)
+            )
+        tab.first.click(timeout=10_000)
+        log.info("Tab clicked: %s", tab_name)
+    except Exception as e:
+        raise RuntimeError(f"Could not click tab '{tab_name}': {e}")
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=20_000)
+    except PlaywrightTimeout:
+        log.warning("networkidle after tab '%s' timed out; proceeding.", tab_name)
+
+    page.wait_for_timeout(500)
+
+
+def _wait_for_render(page):
+    """
+    Render wait strategy (optimized):
+    1. Wait for the dashboard grid to appear in DOM (React mounted).
+    2. Wait for networkidle — fires when all chart API calls finish (no requests for 500ms).
+       This is the fastest accurate signal that chart data has arrived.
+    3. Single scroll to wake below-fold lazy charts + short settle.
+    """
+    # Step 1: grid mount — React has rendered the chart containers
+    try:
+        page.wait_for_selector(
+            ".grid-content, .dashboard-component-chart-holder, "
+            ".slice_container, [class*='chart-slice']",
+            timeout=30_000,
+        )
+        log.info("Dashboard grid mounted.")
+    except PlaywrightTimeout:
+        log.warning("Grid selector timed out; using fixed fallback.")
+        page.wait_for_timeout(5_000)
+
+    # Step 2: networkidle = all XHR/fetch calls done = chart data loaded
+    try:
+        page.wait_for_load_state("networkidle", timeout=20_000)
+        log.info("Network idle — charts data fetched.")
+    except PlaywrightTimeout:
+        log.warning("networkidle timed out; proceeding.")
+
+    # Step 3: scroll to trigger any lazy below-fold charts, then scroll back
+    try:
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(400)
+        page.evaluate("window.scrollTo(0, 0)")
+    except Exception:
+        pass
+
+    # Minimal settle for final paint flush
+    page.wait_for_timeout(500)
+
+
+def _open_download_submenu(page):
+    """
+    Open the dashboard '...' menu and hover over Download.
+    Uses .last on menu selectors; falls back to button:has(svg) as last resort.
+    """
+    menu_candidates = [
+        '[aria-label*="Menu"]',
+        '[aria-label*="menu"]',
+        '[aria-haspopup="menu"]',
+        'button:has(svg)',
+    ]
+
+    menu_found = False
+    for selector in menu_candidates:
+        try:
+            locator = page.locator(selector)
+            count = locator.count()
+            if count == 0:
+                continue
+            locator.last.click()
+            page.wait_for_timeout(2_000)
+            menu_found = True
+            log.info("Opened menu via selector: %s (count=%d)", selector, count)
+            break
+        except Exception:
+            pass
+
+    if not menu_found:
+        raise RuntimeError("Could not open dashboard action menu.")
+
+    try:
+        page.get_by_text("Download", exact=True).hover()
+        page.wait_for_timeout(2_000)
+    except Exception:
+        page.get_by_text("Download", exact=True).click()
+        page.wait_for_timeout(2_000)
+
+
+def _trigger_download(page, export_format, output_dir, filename_hint="export"):
+    """
+    Click the export menu item and wait for the download to complete.
+    Uses multiple text candidates because Superset versions differ in casing/wording.
+    filename_hint is used when Superset's suggested filename is generic.
+    """
+    if export_format == "pdf":
+        candidates = [
+            re.compile(r"export to pdf", re.IGNORECASE),
+            re.compile(r"download pdf", re.IGNORECASE),
+        ]
+    else:
+        candidates = [
+            re.compile(r"download as image", re.IGNORECASE),
+            re.compile(r"download image", re.IGNORECASE),
+            re.compile(r"export image", re.IGNORECASE),
+            re.compile(r"export to image", re.IGNORECASE),
+        ]
+
+    # Primary: exact=True match — same as test.py (proven working)
+    exact_labels = {
+        "pdf": "Export to PDF",
+        "png": "Download as Image",
+    }
+
+    clicked = False
+    with page.expect_download(timeout=180_000) as dl_info:
+
+        # Try exact match first (test.py approach)
+        try:
+            page.get_by_text(exact_labels[export_format], exact=True).click()
+            clicked = True
+            log.info("Clicked: %s (exact)", exact_labels[export_format])
+        except Exception:
+            pass
+
+        # Fallback: case-insensitive regex candidates
+        if not clicked:
+            for pattern in candidates:
+                try:
+                    loc = page.get_by_text(pattern)
+                    if loc.count() > 0:
+                        loc.first.click()
+                        clicked = True
+                        log.info("Clicked export item matching: %s", pattern.pattern)
+                        break
+                except Exception:
+                    pass
+
+        if not clicked:
+            try:
+                visible = page.locator("li[role='menuitem'], .ant-dropdown-menu-item").all_text_contents()
+                log.error("Available menu items: %s", visible)
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Could not find export menu item for format '{export_format}'. "
+                "Check logs for available menu items."
+            )
+
+    download = dl_info.value
+    ext = "pdf" if export_format == "pdf" else "png"
+    raw_name = download.suggested_filename or f"{filename_hint}.{ext}"
+    # Strip ISO timestamp Superset appends: e.g. "my-dashboard-2026-06-03T06-19-07.138Z.jpg"
+    clean_stem = re.sub(r"-\d{4}-\d{2}-\d{2}T[\d\-\.]+Z$", "", Path(raw_name).stem)
+    filename = f"{clean_stem}.{ext}"
+    output_path = os.path.join(output_dir, filename)
+    download.save_as(output_path)
+    log.info("Downloaded: %s", output_path)
+    return output_path
+
+
+def _safe_filename(text: str) -> str:
+    """Strip characters that are unsafe in filenames."""
+    return re.sub(r'[\\/*?:"<>|]', "_", text).strip()
+
+
+def _prewarm_tabs(page, tab_names: list):
+    """
+    Click through every tab once so their chart data is fetched and cached
+    in the browser. 5s wait per tab matches working local script timing.
+    """
+    tabs = page.locator('[role="tab"]')
+    count = tabs.count()
+    log.info("Pre-warming %d tab(s)...", count)
+
+    for i in range(count):
+        try:
+            tab = tabs.nth(i)
+            name = (tab.text_content() or "").strip()
+            log.info("Loading tab %d/%d: %s", i + 1, count, name)
+            tab.click()
+            page.wait_for_timeout(5_000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15_000)
+            except Exception:
+                pass
+        except Exception as e:
+            log.warning("Tab load error: %s", e)
+
+    try:
+        tabs.first.click()
+    except Exception:
+        pass
+
+    log.info("All tabs pre-warmed.")
+
+
+def _pngs_to_pdf(png_paths: list, output_pdf_path: str):
+    """
+    Merge a list of PNG screenshots into a single multi-page PDF using Pillow.
+    Each PNG becomes one page; page size matches the image dimensions.
+    """
+    images = [Image.open(p).convert("RGB") for p in png_paths]
+    if not images:
+        raise ValueError("No images to merge into PDF")
+    images[0].save(
+        output_pdf_path,
+        save_all=True,
+        append_images=images[1:],
+        format="PDF",
+        resolution=150,
+    )
+    log.info(
+        "PDF created from %d page(s): %s (%d bytes)",
+        len(images),
+        output_pdf_path,
+        os.path.getsize(output_pdf_path),
+    )
+
+
+def _do_export(dashboard_id, chart_id, export_formats: list, theme="light"):
+    """
+    Core export logic executed inside the browser lock.
+
+    Strategy:
+    1. Load dashboard, wait for first tab to render fully.
+    2. PRE-WARM: click every tab once so all chart data is fetched and cached
+       in the browser. After this, tab switches are instant — no re-fetch.
+    3. EXPORT LOOP: for each tab, click it (instant) then use
+       "Download as Image" from the menu to get the PNG Superset renders.
+    4. PDF requested? Merge all PNGs into one multi-page PDF with Pillow.
+
+    Returns:
+        {
+          "png": { "Tab Name": "/path/Tab Name.png", ... }   # if png in formats
+          "pdf": "/path/dashboard_28_export.pdf"             # if pdf in formats
+        }
+    """
+    Path(UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
+
+    target_url = _build_target_url(dashboard_id, chart_id)
+    context = _get_browser_context()
+
+    page = _get_warm_page(target_url)
+    warm_hit = page is not None
+
+    if warm_hit:
+        page.emulate_media(color_scheme="dark" if theme == "dark" else "light")
+        log.info("Warm reload for %s", target_url)
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=30_000)
+        except Exception as e:
+            log.warning("Warm reload failed (%s); falling back to cold path.", e)
+            _evict_warm_page(target_url)
+            warm_hit = False
+
+    if not warm_hit:
+        page = context.new_page()
+        _ensure_logged_in(page, context, target_url, theme=theme)
+
+    try:
+        # Wait for the first tab to fully render
+        _wait_for_render(page)
+
+        tab_names = _get_tab_names(page)
+        has_tabs = bool(tab_names)
+
+        if has_tabs:
+            # Pre-warm: click all tabs so their data loads into browser cache
+            _prewarm_tabs(page, tab_names)
+        else:
+            tab_names = [f"dashboard_{dashboard_id}" if dashboard_id else f"chart_{chart_id}"]
+
+        # After pre-warm, ALL tab content is loaded in the DOM.
+        # One single "Download as Image" click captures the entire dashboard
+        # (all tabs) as one PNG — no loop needed.
+        target_id = dashboard_id or chart_id
+        png_filename = f"dashboard_{target_id}.png"
+        png_path = os.path.join(UPLOAD_DIR, png_filename)
+
+        log.info("All tabs loaded — triggering single Download as Image...")
+        _open_download_submenu(page)
+        png_path = _trigger_download(
+            page, "png", UPLOAD_DIR, filename_hint=f"dashboard_{target_id}"
+        )
+
+        log.info("PNG saved: %s (%d bytes)", png_path, os.path.getsize(png_path))
+
+        _store_warm_page(target_url, page)
+
+        result_files = {}
+
+        if "png" in export_formats:
+            result_files["png"] = {f"dashboard_{target_id}": png_path}
+
+        if "pdf" in export_formats:
+            pdf_path = os.path.join(UPLOAD_DIR, f"dashboard_{target_id}.pdf")
+            _pngs_to_pdf([png_path], pdf_path)
+            result_files["pdf"] = pdf_path
+
+        return result_files
+
+    except Exception:
+        _evict_warm_page(target_url)
+        try:
+            page.close()
+        except Exception:
+            pass
+        raise
+
+
+def run_export_with_retry(dashboard_id, chart_id, export_formats: list, theme="light"):
+    """
+    Run _do_export with retry logic.
+    On failure, resets the browser context so the next attempt starts fresh.
+    """
+    last_error = None
+
+    for attempt in range(1, EXPORT_MAX_RETRIES + 2):  # attempts = retries + 1
+        try:
+            with _browser_lock:
+                return _do_export(dashboard_id, chart_id, export_formats, theme=theme)
+
+        except Exception as exc:
+            last_error = exc
+            log.warning(
+                "Export attempt %d/%d failed: %s",
+                attempt,
+                EXPORT_MAX_RETRIES + 1,
+                exc,
+            )
+            if attempt <= EXPORT_MAX_RETRIES:
+                with _browser_lock:
+                    _reset_browser_context()
+                time.sleep(2)
+
+    raise last_error
+
 
 # =========================
 # ROUTES
@@ -85,24 +689,20 @@ def superset_login():
 def health():
     return jsonify({
         "status": "flask_up",
-        "superset_running": is_superset_running()
+        "superset_running": is_superset_running(),
     })
 
 
 @app.route("/api/superset/guest-token", methods=["POST"])
 def guest_token():
     data = request.json or {}
-    print("Received data:", data)
+    log.info("Guest token request: %s", data)
 
     try:
         access_token, csrf_token, session = superset_login()
     except Exception as e:
-        return jsonify({
-            "error": "Superset login / csrf failed",
-            "details": str(e)
-        }), 500
-
-    payload = data
+        log.error("Superset login/csrf failed: %s", e)
+        return jsonify({"error": "Superset login / csrf failed", "details": str(e)}), 500
 
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -110,11 +710,7 @@ def guest_token():
         "Content-Type": "application/json",
     }
 
-    r = session.post(
-        SUPERSET_GUEST_TOKEN_API,
-        json=payload,
-        headers=headers,
-    )
+    r = session.post(SUPERSET_GUEST_TOKEN_API, json=data, headers=headers)
 
     if r.status_code != 200:
         return jsonify({
@@ -126,14 +722,119 @@ def guest_token():
     return jsonify(r.json())
 
 
+@app.route("/export", methods=["POST"])
+def export():
+    """
+    Export ALL tabs of a Superset dashboard as PNG + PDF (or a chosen format).
+    Tabs are auto-detected — user does not need to specify them.
+    All files are returned as a single ZIP archive.
+
+    Request body (JSON):
+        dashboard_id  int   — required unless chart_id is given
+        chart_id      int   — optional; exports a single chart view
+        format        str   — "pdf", "png", or "all" (default — both)
+        theme         str   — "light" (default) or "dark"
+
+    Response: application/zip
+        Structure inside ZIP:
+            Per Technology.pdf
+            Per Technology.png
+            Network.pdf
+            Network.png
+            Down Cells.pdf
+            Down Cells.png
+            ...
+    """
+    body = request.json or {}
+
+    dashboard_id = body.get("dashboard_id")
+    chart_id = body.get("chart_id")
+    fmt_raw = str(body.get("format", "all")).lower()
+    theme = str(body.get("theme", "light")).lower()
+
+    # --- Validate ---
+    if not dashboard_id and not chart_id:
+        return jsonify({"error": "dashboard_id or chart_id is required"}), 400
+
+    if fmt_raw not in ("pdf", "png", "all"):
+        return jsonify({"error": "format must be 'pdf', 'png', or 'all'"}), 400
+
+    if theme not in ("light", "dark"):
+        return jsonify({"error": "theme must be 'light' or 'dark'"}), 400
+
+    # if dashboard_id is not None and not isinstance(dashboard_id, int):
+    #     return jsonify({"error": "dashboard_id must be an integer"}), 400
+
+    # if chart_id is not None and not isinstance(chart_id, int):
+    #     return jsonify({"error": "chart_id must be an integer"}), 400
+
+    # Check that the given ID actually exists in Superset
+    valid, err_msg = _validate_ids(dashboard_id, chart_id)
+    if not valid:
+        return jsonify({"error": err_msg}), 404
+
+    export_formats = ["pdf", "png"] if fmt_raw == "all" else [fmt_raw]
+
+    log.info(
+        "Export request — dashboard_id=%s chart_id=%s formats=%s theme=%s",
+        dashboard_id, chart_id, export_formats, theme,
+    )
+
+    # Run export
+    # result_files = {
+    #   "pdf": "/path/dashboard_28_export.pdf"          (single merged PDF)
+    #   "png": { "Per Technology": "/path/Per Technology.png", ... }
+    # }
+    try:
+        result_files = run_export_with_retry(
+            dashboard_id, chart_id, export_formats, theme=theme
+        )
+    except Exception as exc:
+        log.error("Export failed: %s", exc)
+        return jsonify({"error": "Export failed", "details": str(exc)}), 500
+
+    target_id = dashboard_id or chart_id
+
+    # ── Return file paths as JSON ─────────────────────────────────────────────
+    response_data = {}
+
+    if "pdf" in result_files:
+        # response_data["pdf"] = {"path": result_files["pdf"]}
+        response_data["path"] = result_files["pdf"]
+
+    if "png" in result_files:
+        png_path = list(result_files["png"].values())[0]
+        # response_data["png"] = {"path": png_path}
+        response_data["path"] = png_path
+
+    return jsonify(response_data)
+
+
+@app.route("/serve-file", methods=["GET"])
+def serve_file():
+    file_path = request.args.get("path")
+
+    if not file_path:
+        return jsonify({"error": "Provide 'path' query parameter"}), 400
+
+    real_path = os.path.realpath(file_path)
+    real_upload = os.path.realpath(UPLOAD_DIR)
+    if not real_path.startswith(real_upload + os.sep) and real_path != real_upload:
+        return jsonify({"error": "Access denied: path is outside uploads directory"}), 403
+
+    if not os.path.isfile(real_path):
+        return jsonify({"error": f"File not found: {os.path.basename(real_path)}"}), 404
+
+    log.info("Serving file: %s", real_path)
+    return send_file(real_path, as_attachment=True, download_name=os.path.basename(real_path))
+
+
 @app.route("/dashboard")
 def embed_dashboard():
     return render_template("embed.html")
 
-# =========================
-# MAIN
-# =========================
-if __name__ == "__main__":
-    print("🚀 Starting Flask app (Superset assumed already running)")
-    app.run(host="0.0.0.0", port=FLASK_PORT, debug=True)
 
+
+if __name__ == "__main__":
+    log.info("Starting Flask app on port %d (Superset assumed running)", FLASK_PORT)
+    app.run(host="0.0.0.0", port=FLASK_PORT, debug=True)

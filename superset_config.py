@@ -6,6 +6,7 @@ SQLALCHEMY_DATABASE_URI = (
 )
 
 SECRET_KEY = "971798e5e6d5ede611a235cda7f72ae71c24bb08bf40219a4fd1d631e69b8a11"
+# SECRET_KEY = "+JrGQOfBT2NUxEuw31c6xXlTPrLvIVXOLQqRLXOTQReIPuygk7bpGkCS"
 
 ROW_LIMIT = 10000
 SUPERSET_WEBSERVER_TIMEOUT = 300
@@ -24,6 +25,9 @@ FEATURE_FLAGS = {
     "EMBEDDED_SUPERSET": True,
     "ENABLE_METRICFLOW": False,
     # "DASHBOARD_RBAC": True,
+    "ALERT_REPORTS": True,
+    "ALERTS_ATTACH_REPORTS": True,
+    "ALERT_REPORT_TABS": True, 
 }
 
 # GLOBAL_ASYNC_QUERIES = False
@@ -42,6 +46,10 @@ CORS_OPTIONS = {
         "http://localhost:8088",
         "http://localhost:5173",
         "http://192.168.0.102:5173",
+        "http://192.168.0.171:5173",
+        "http://192.168.0.172:5173",
+        "http://dyserver:5173",
+        "http://dyserver2:5173"
     ],
     "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"],
 }
@@ -64,3 +72,24 @@ TALISMAN_ENABLED = False
 APP_NAME = "DataYog"
 APP_ICON = "/data/system/dataplus_superset/loading.cff8a5da.gif"
 APP_ICON_WIDTH = 126
+
+from celery.schedules import crontab
+
+class CeleryConfig:
+    broker_url = "redis://localhost:6379/0"
+    imports = (
+        "superset.sql_lab",
+        "superset.tasks.scheduler",
+    )
+
+CELERY_CONFIG = CeleryConfig
+
+
+WEBDRIVER_TYPE = "chrome"
+
+WEBDRIVER_OPTION_ARGS = [
+    "--headless",
+    "--disable-gpu",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+]
