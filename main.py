@@ -11,7 +11,7 @@ from flask import Flask, jsonify, request, render_template, Response, send_file
 from flask_cors import CORS
 from PIL import Image
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
-
+from pypdf import PdfWriter
 # =========================
 # LOGGING
 # =========================
@@ -88,7 +88,6 @@ _warm_page_order: list = []  # LRU order of urls
 
 
 def _get_browser_context():
-    """Return a reusable browser context, launching Playwright lazily."""
     global _playwright, _browser, _browser_context
 
     if _browser_context is not None:
@@ -97,27 +96,34 @@ def _get_browser_context():
     log.info("Launching Playwright browser (first time)...")
     _playwright = sync_playwright().start()
     _browser = _playwright.chromium.launch(
+        # PDF generation (page.pdf()) is only supported in headless Chromium —
+        # required for the vector-quality (crisp-at-any-zoom) PDF export.
         headless=True,
         args=[
             "--no-sandbox",
             "--disable-dev-shm-usage",
             "--disable-gpu",
-            "--window-size=1920,1080",
+            "--force-device-scale-factor=1",
         ],
     )
 
     storage = SESSION_FILE if os.path.exists(SESSION_FILE) else None
-    if storage:
-        log.info("Loading saved browser session from %s", SESSION_FILE)
 
+    # FIX: Viewport size ko Landscape Desktop resolution (1920x1080) kar do
+    # device_scale_factor=2: chart titles/text are already vector (crisp at
+    # any zoom) via page.pdf(), but the chart curves themselves are drawn on
+    # <canvas> by the charting library, so they're baked in as a raster
+    # image at whatever resolution Chrome renders them at. Capturing at 2x
+    # density (like a Retina display) doubles that resolution, so curves
+    # stay sharp at higher PDF zoom levels too.
     _browser_context = _browser.new_context(
         accept_downloads=True,
         viewport={"width": 1920, "height": 1080},
+        device_scale_factor=2,
         storage_state=storage,
     )
 
     return _browser_context
-
 
 def _reset_browser_context():
     """Close and reset everything so the next call re-creates from scratch."""
@@ -352,7 +358,31 @@ def _select_tab(page, tab_name: str):
     except PlaywrightTimeout:
         log.warning("networkidle after tab '%s' timed out; proceeding.", tab_name)
 
+    _wait_for_charts_to_finish_loading(page)
     page.wait_for_timeout(500)
+
+
+def _wait_for_charts_to_finish_loading(page, timeout=20_000):
+    """
+    Wait until every chart's loading spinner has disappeared.
+    networkidle only proves the XHR/fetch has returned — the chart library
+    (echarts/nvd3) still needs a render tick after that to paint the canvas/
+    svg, and on a freshly-selected tab that render can lag behind
+    networkidle enough to get captured mid-blank. Superset shows a spinner
+    (".loading", Ant Design's ".ant-spin"/".antd5-spin") on each chart slice
+    while its data/render is pending, so waiting for zero visible spinners
+    is a more reliable "chart is actually painted" signal than networkidle.
+    """
+    spinner_selector = ".loading, .ant-spin-spinning, .antd5-spin-spinning"
+    try:
+        page.wait_for_function(
+            """(sel) => document.querySelectorAll(sel).length === 0""",
+            arg=spinner_selector,
+            timeout=timeout,
+        )
+        log.info("No chart spinners left — charts painted.")
+    except PlaywrightTimeout:
+        log.warning("Chart spinners still present after %dms; proceeding anyway.", timeout)
 
 
 def _wait_for_render(page):
@@ -362,6 +392,7 @@ def _wait_for_render(page):
     2. Wait for networkidle — fires when all chart API calls finish (no requests for 500ms).
        This is the fastest accurate signal that chart data has arrived.
     3. Single scroll to wake below-fold lazy charts + short settle.
+    4. Wait for per-chart loading spinners to clear (data fetched != painted).
     """
     # Step 1: grid mount — React has rendered the chart containers
     try:
@@ -385,13 +416,17 @@ def _wait_for_render(page):
     # Step 3: scroll to trigger any lazy below-fold charts, then scroll back
     try:
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(400)
+        page.wait_for_timeout(800)
         page.evaluate("window.scrollTo(0, 0)")
     except Exception:
         pass
 
+    # Step 4: chart-level spinners can still be visible after networkidle —
+    # wait for them to clear before the final settle.
+    _wait_for_charts_to_finish_loading(page)
+
     # Minimal settle for final paint flush
-    page.wait_for_timeout(500)
+    page.wait_for_timeout(800)
 
 
 def _open_download_submenu(page):
@@ -435,8 +470,7 @@ def _open_download_submenu(page):
 def _trigger_download(page, export_format, output_dir, filename_hint="export"):
     """
     Click the export menu item and wait for the download to complete.
-    Uses multiple text candidates because Superset versions differ in casing/wording.
-    filename_hint is used when Superset's suggested filename is generic.
+    Forces the file to be saved with filename_hint (Tab Name).
     """
     if export_format == "pdf":
         candidates = [
@@ -451,7 +485,6 @@ def _trigger_download(page, export_format, output_dir, filename_hint="export"):
             re.compile(r"export to image", re.IGNORECASE),
         ]
 
-    # Primary: exact=True match — same as test.py (proven working)
     exact_labels = {
         "pdf": "Export to PDF",
         "png": "Download as Image",
@@ -460,7 +493,6 @@ def _trigger_download(page, export_format, output_dir, filename_hint="export"):
     clicked = False
     with page.expect_download(timeout=180_000) as dl_info:
 
-        # Try exact match first (test.py approach)
         try:
             page.get_by_text(exact_labels[export_format], exact=True).click()
             clicked = True
@@ -468,7 +500,6 @@ def _trigger_download(page, export_format, output_dir, filename_hint="export"):
         except Exception:
             pass
 
-        # Fallback: case-insensitive regex candidates
         if not clicked:
             for pattern in candidates:
                 try:
@@ -482,27 +513,24 @@ def _trigger_download(page, export_format, output_dir, filename_hint="export"):
                     pass
 
         if not clicked:
-            try:
-                visible = page.locator("li[role='menuitem'], .ant-dropdown-menu-item").all_text_contents()
-                log.error("Available menu items: %s", visible)
-            except Exception:
-                pass
-            raise RuntimeError(
-                f"Could not find export menu item for format '{export_format}'. "
-                "Check logs for available menu items."
-            )
+            raise RuntimeError(f"Could not find export menu item for format '{export_format}'.")
 
     download = dl_info.value
     ext = "pdf" if export_format == "pdf" else "png"
-    raw_name = download.suggested_filename or f"{filename_hint}.{ext}"
-    # Strip ISO timestamp Superset appends: e.g. "my-dashboard-2026-06-03T06-19-07.138Z.jpg"
-    clean_stem = re.sub(r"-\d{4}-\d{2}-\d{2}T[\d\-\.]+Z$", "", Path(raw_name).stem)
-    filename = f"{clean_stem}.{ext}"
+
+    # Fix: Superset default name override karke Tab Name ko file name banao
+    if filename_hint:
+        safe_name = _safe_filename(filename_hint)
+        filename = f"{safe_name}.{ext}"
+    else:
+        raw_name = download.suggested_filename or f"export.{ext}"
+        clean_stem = re.sub(r"-\d{4}-\d{2}-\d{2}T[\d\-\.]+Z$", "", Path(raw_name).stem)
+        filename = f"{clean_stem}.{ext}"
+
     output_path = os.path.join(output_dir, filename)
     download.save_as(output_path)
     log.info("Downloaded: %s", output_path)
     return output_path
-
 
 def _safe_filename(text: str) -> str:
     """Strip characters that are unsafe in filenames."""
@@ -540,26 +568,106 @@ def _prewarm_tabs(page, tab_names: list):
     log.info("All tabs pre-warmed.")
 
 
-def _pngs_to_pdf(png_paths: list, output_pdf_path: str):
+# Hard ceiling for this report type — vector PDFs from page.pdf() should
+# stay far under this; a breach just gets logged for now.
+PDF_HARD_CAP_BYTES = 10 * 1024 * 1024
+
+
+def _isolate_grid_content(page):
     """
-    Merge a list of PNG screenshots into a single multi-page PDF using Pillow.
-    Each PNG becomes one page; page size matches the image dimensions.
+    Hide everything except the chart grid (Superset's navbar, dashboard
+    title, filter bar and tab strip) so page.pdf() prints only the charts —
+    matching what Superset's own "Export to PDF"/"Download as Image"
+    capture. Walks up the DOM from .grid-content to <body>, hiding every
+    sibling encountered along the way. Those siblings are by definition
+    outside the grid's own ancestor chain, so this can't touch the grid's
+    rendering, and — unlike matching a specific class name — it keeps
+    working regardless of Superset's (build-hashed, unstable) CSS classes.
+    Elements are tagged so _restore_hidden_chrome() can bring them back.
+
+    On tabbed dashboards, Ant Design's Tabs component keeps every tab's
+    pane mounted in the DOM at once (only the active one is un-hidden) so
+    chart data isn't re-fetched on every switch — meaning there's one
+    .grid-content per tab, all present simultaneously. A plain
+    `document.querySelector('.grid-content')` always returns the first one
+    in DOM order regardless of which tab is actually active, which is why
+    every tab used to print the same (first) tab's content. Scoping the
+    query to `.ant-tabs-tabpane-active` fixes that; the plain fallback
+    keeps this working on dashboards with no tabs at all.
     """
-    images = [Image.open(p).convert("RGB") for p in png_paths]
-    if not images:
-        raise ValueError("No images to merge into PDF")
-    images[0].save(
-        output_pdf_path,
-        save_all=True,
-        append_images=images[1:],
-        format="PDF",
-        resolution=150,
+    page.evaluate(
+        """
+        () => {
+            let node = document.querySelector('.ant-tabs-tabpane-active .grid-content')
+                    || document.querySelector('.grid-content');
+            while (node && node.parentElement && node.parentElement !== document.body) {
+                const parent = node.parentElement;
+                for (const sib of Array.from(parent.children)) {
+                    if (sib !== node) {
+                        sib.setAttribute('data-pdf-hidden', 'true');
+                        sib.style.display = 'none';
+                    }
+                }
+                node = parent;
+            }
+        }
+        """
     )
+
+
+def _restore_hidden_chrome(page):
+    """Undo _isolate_grid_content() so the navbar/filters/tabs work again."""
+    page.evaluate(
+        """
+        () => {
+            document.querySelectorAll('[data-pdf-hidden]').forEach(el => {
+                el.style.display = '';
+                el.removeAttribute('data-pdf-hidden');
+            });
+        }
+        """
+    )
+
+
+def _export_tab_pdf(page, output_path: str):
+    """
+    Print the currently-selected tab straight from the browser
+    (Playwright's page.pdf(), Chromium print-to-PDF) instead of taking a
+    screenshot — text and vector graphics come out crisp at any zoom
+    level, not just at screen resolution. Page size is set to the grid's
+    own content size, so there's no blank space and no Portrait/Letter
+    mismatch to fix up afterwards.
+    """
+    page.emulate_media(media="screen")
+    _isolate_grid_content(page)
+    try:
+        page.wait_for_timeout(300)
+        size = page.evaluate(
+            "() => ({w: document.documentElement.scrollWidth, h: document.documentElement.scrollHeight})"
+        )
+        page.pdf(
+            path=output_path,
+            width=f"{size['w']}px",
+            height=f"{size['h']}px",
+            print_background=True,
+            margin={"top": "0px", "right": "0px", "bottom": "0px", "left": "0px"},
+        )
+    finally:
+        _restore_hidden_chrome(page)
+
+
+def _merge_pdfs(pdf_paths: list, output_pdf_path: str):
+    """Merge multiple single-page PDFs into one file."""
+    writer = PdfWriter()
+    for pdf_path in pdf_paths:
+        writer.append(pdf_path)
+
+    with open(output_pdf_path, "wb") as f:
+        writer.write(f)
+
     log.info(
-        "PDF created from %d page(s): %s (%d bytes)",
-        len(images),
-        output_pdf_path,
-        os.path.getsize(output_pdf_path),
+        "Merged %d PDF(s) into: %s (%d bytes)",
+        len(pdf_paths), output_pdf_path, os.path.getsize(output_pdf_path),
     )
 
 
@@ -567,19 +675,12 @@ def _do_export(dashboard_id, chart_id, export_formats: list, theme="light"):
     """
     Core export logic executed inside the browser lock.
 
-    Strategy:
-    1. Load dashboard, wait for first tab to render fully.
-    2. PRE-WARM: click every tab once so all chart data is fetched and cached
-       in the browser. After this, tab switches are instant — no re-fetch.
-    3. EXPORT LOOP: for each tab, click it (instant) then use
-       "Download as Image" from the menu to get the PNG Superset renders.
-    4. PDF requested? Merge all PNGs into one multi-page PDF with Pillow.
-
-    Returns:
-        {
-          "png": { "Tab Name": "/path/Tab Name.png", ... }   # if png in formats
-          "pdf": "/path/dashboard_28_export.pdf"             # if pdf in formats
-        }
+    Workflow:
+    1. Open dashboard.
+    2. Detect all tabs using `_get_tab_names()`.
+    3. Loop over tabs -> `_select_tab()` -> `_wait_for_render()` -> Native Export to PDF.
+    4. Save each tab PDF using the exact Tab Name.
+    5. Merge all individual Tab PDFs into one final PDF.
     """
     Path(UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -604,45 +705,68 @@ def _do_export(dashboard_id, chart_id, export_formats: list, theme="light"):
         _ensure_logged_in(page, context, target_url, theme=theme)
 
     try:
-        # Wait for the first tab to fully render
+        # Wait for the dashboard React components to mount
         _wait_for_render(page)
 
         tab_names = _get_tab_names(page)
         has_tabs = bool(tab_names)
-
-        if has_tabs:
-            # Pre-warm: click all tabs so their data loads into browser cache
-            _prewarm_tabs(page, tab_names)
-        else:
-            tab_names = [f"dashboard_{dashboard_id}" if dashboard_id else f"chart_{chart_id}"]
-
-        # After pre-warm, ALL tab content is loaded in the DOM.
-        # One single "Download as Image" click captures the entire dashboard
-        # (all tabs) as one PNG — no loop needed.
         target_id = dashboard_id or chart_id
-        png_filename = f"dashboard_{target_id}.png"
-        png_path = os.path.join(UPLOAD_DIR, png_filename)
-
-        log.info("All tabs loaded — triggering single Download as Image...")
-        _open_download_submenu(page)
-        png_path = _trigger_download(
-            page, "png", UPLOAD_DIR, filename_hint=f"dashboard_{target_id}"
-        )
-
-        log.info("PNG saved: %s (%d bytes)", png_path, os.path.getsize(png_path))
-
-        _store_warm_page(target_url, page)
 
         result_files = {}
 
+        if "pdf" in export_formats:
+            final_pdf_path = os.path.join(UPLOAD_DIR, f"dashboard_{target_id}.pdf")
+
+            if has_tabs:
+                log.info("Found %d tab(s). Printing vector PDF for each tab...", len(tab_names))
+                tab_pdf_paths = []
+
+                for idx, tab_name in enumerate(tab_names):
+                    log.info("Processing Tab %d/%d: '%s'", idx + 1, len(tab_names), tab_name)
+
+                    # 1. Select the tab
+                    _select_tab(page, tab_name)
+
+                    # 2. Wait for full render
+                    _wait_for_render(page)
+
+                    # 3. Print this tab straight from the browser (vector PDF)
+                    tab_pdf_path = os.path.join(UPLOAD_DIR, f"{_safe_filename(tab_name)}.pdf")
+                    _export_tab_pdf(page, tab_pdf_path)
+                    tab_pdf_paths.append(tab_pdf_path)
+
+                # 4. Merge all tab PDFs into one final file
+                log.info("Merging %d tab PDFs into single file...", len(tab_pdf_paths))
+                _merge_pdfs(tab_pdf_paths, final_pdf_path)
+
+                for path in tab_pdf_paths:
+                    try:
+                        os.remove(path)
+                    except Exception as e:
+                        log.warning("Could not delete temporary file %s: %s", path, e)
+
+            else:
+                log.info("No tabs detected. Printing standard single PDF...")
+                _export_tab_pdf(page, final_pdf_path)
+
+            log.info("PDF size: %d bytes", os.path.getsize(final_pdf_path))
+            if os.path.getsize(final_pdf_path) > PDF_HARD_CAP_BYTES:
+                log.warning(
+                    "PDF (%d bytes) exceeds hard cap of %d bytes",
+                    os.path.getsize(final_pdf_path), PDF_HARD_CAP_BYTES,
+                )
+
+            result_files["pdf"] = final_pdf_path
+
         if "png" in export_formats:
+            log.info("Triggering image download...")
+            _open_download_submenu(page)
+            png_path = _trigger_download(
+                page, "png", UPLOAD_DIR, filename_hint=f"dashboard_{target_id}"
+            )
             result_files["png"] = {f"dashboard_{target_id}": png_path}
 
-        if "pdf" in export_formats:
-            pdf_path = os.path.join(UPLOAD_DIR, f"dashboard_{target_id}.pdf")
-            _pngs_to_pdf([png_path], pdf_path)
-            result_files["pdf"] = pdf_path
-
+        _store_warm_page(target_url, page)
         return result_files
 
     except Exception:
@@ -652,7 +776,6 @@ def _do_export(dashboard_id, chart_id, export_formats: list, theme="light"):
         except Exception:
             pass
         raise
-
 
 def run_export_with_retry(dashboard_id, chart_id, export_formats: list, theme="light"):
     """
@@ -681,7 +804,7 @@ def run_export_with_retry(dashboard_id, chart_id, export_formats: list, theme="l
 
     raise last_error
 
-
+# run_export_with_retry(dashboard_id=28, chart_id=None, export_formats=["pdf"])
 # =========================
 # ROUTES
 # =========================

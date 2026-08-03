@@ -44,6 +44,7 @@ Thumbs.db
 # Superset specific (optional - agar runtime files generate hote hain)
 superset.db
 *.db
+superset_backup.dump
 
 # PM2
 .pm2/
