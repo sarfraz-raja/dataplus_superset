@@ -121,6 +121,7 @@ def _get_browser_context():
         viewport={"width": 1920, "height": 1080},
         device_scale_factor=2,
         storage_state=storage,
+        ignore_https_errors=True,
     )
 
     return _browser_context

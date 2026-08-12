@@ -48,3 +48,5 @@ superset_backup.dump
 
 # PM2
 .pm2/
+
+.uploads/
