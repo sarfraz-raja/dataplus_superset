@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -277,6 +278,62 @@ def _validate_ids(dashboard_id, chart_id):
     return True, None
 
 
+def _get_dashboard_tabs_meta(dashboard_id):
+    """
+    Fetch dashboard tabs (id + name, in display order) from Superset's
+    position_json — the same source of truth the dashboard UI renders from.
+
+    Returns a dict: {dashboard_title, has_tabs, tab_count, tabs: [...]}
+    Raises RuntimeError on lookup/API failure.
+    """
+    access_token, _, _ = superset_login()
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    r = requests.get(
+        f"{SUPERSET_BASE}/api/v1/dashboard/{dashboard_id}",
+        headers=headers,
+        timeout=10,
+    )
+    if r.status_code == 404:
+        raise RuntimeError(f"Dashboard with id {dashboard_id} not found")
+    if r.status_code != 200:
+        raise RuntimeError(f"Could not fetch dashboard {dashboard_id} (status {r.status_code})")
+
+    result = r.json().get("result", {})
+    position_json_raw = result.get("position_json")
+
+    tabs = []
+    if position_json_raw:
+        position_json = json.loads(position_json_raw)
+
+        # A dashboard can have multiple TABS containers (nested tab groups);
+        # walk every one and flatten in document order using its `children`
+        # array, which is the actual left-to-right tab order shown in the UI.
+        for node_id, node in position_json.items():
+            if not isinstance(node, dict) or node.get("type") != "TABS":
+                continue
+            for idx, tab_id in enumerate(node.get("children", [])):
+                tab_node = position_json.get(tab_id)
+                if not tab_node or tab_node.get("type") != "TAB":
+                    continue
+                meta = tab_node.get("meta", {})
+                name = meta.get("text") or meta.get("defaultText") or meta.get("placeholder") or tab_id
+                tabs.append({
+                    "index": idx,
+                    "id": tab_id,
+                    "name": name,
+                    "tabs_container_id": node_id,
+                })
+
+    return {
+        "dashboard_id": dashboard_id,
+        "dashboard_title": result.get("dashboard_title"),
+        "has_tabs": bool(tabs),
+        "tab_count": len(tabs),
+        "tabs": tabs,
+    }
+
+
 def _build_target_url(dashboard_id, chart_id):
     """
     Return the Superset URL to navigate to for export.
@@ -402,10 +459,14 @@ def _wait_for_render(page):
         page.wait_for_selector(
             ".grid-content, .dashboard-component-chart-holder, "
             ".slice_container, [class*='chart-slice']",
-            timeout=30_000,
+            timeout=8_000,
         )
         log.info("Dashboard grid mounted.")
     except PlaywrightTimeout:
+        # On tab switches this selector reliably times out anyway (the
+        # elements are already in the DOM from the previous tab, so no new
+        # match ever fires) — the fixed fallback below is what actually
+        # carries it, so keep the timeout short instead of burning 30s here.
         log.warning("Grid selector timed out; using fixed fallback.")
         page.wait_for_timeout(5_000)
 
@@ -494,7 +555,11 @@ def _trigger_download(page, export_format, output_dir, filename_hint="export"):
     }
 
     clicked = False
-    with page.expect_download(timeout=180_000) as dl_info:
+    # A real download normally fires within a couple seconds of the click;
+    # 45s is already generous headroom. 180s just meant a broken/hung
+    # download silently ate 3 minutes per attempt (and up to 3x that across
+    # retries) before finally failing.
+    with page.expect_download(timeout=45_000) as dl_info:
 
         try:
             page.get_by_text(exact_labels[export_format], exact=True).click()
@@ -674,7 +739,7 @@ def _merge_pdfs(pdf_paths: list, output_pdf_path: str):
     )
 
 
-def _do_export(dashboard_id, chart_id, export_formats: list, theme="light"):
+def _do_export(dashboard_id, chart_id, export_formats: list, theme="light", extra_tab_name=None):
     """
     Core export logic executed inside the browser lock.
 
@@ -684,6 +749,9 @@ def _do_export(dashboard_id, chart_id, export_formats: list, theme="light"):
     3. Loop over tabs -> `_select_tab()` -> `_wait_for_render()` -> Native Export to PDF.
     4. Save each tab PDF using the exact Tab Name.
     5. Merge all individual Tab PDFs into one final PDF.
+    6. If extra_tab_name is given, additionally select that one tab and export
+       just its PNG image (used when the caller passed a tab_id — the full
+       dashboard export above still happens as usual, this is an extra file).
     """
     Path(UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -769,6 +837,60 @@ def _do_export(dashboard_id, chart_id, export_formats: list, theme="light"):
             )
             result_files["png"] = {f"dashboard_{target_id}": png_path}
 
+        if extra_tab_name:
+            # Best-effort: the dashboard/PDF export above already succeeded,
+            # so a failure here (e.g. this tab's native image download hangs
+            # or errors) must not blow up the whole request — that would
+            # discard already-good work and trigger a full retry of the
+            # expensive PDF loop for something unrelated. Log and move on.
+            #
+            # Uses a BRAND NEW page instead of reusing `page`: Superset never
+            # unmounts a tab's chart grid once visited (it just toggles which
+            # one is on top), so on `page` — which by now may have visited
+            # every tab via the PDF loop above — "Download as Image" would
+            # capture every previously-visited tab's charts stacked together,
+            # not just this one. A fresh page that goes straight to this tab
+            # and nothing else guarantees an isolated, single-tab capture.
+            tab_page = None
+            try:
+                log.info("Exporting extra tab image for: %s (fresh page)", extra_tab_name)
+                tab_page = context.new_page()
+                _ensure_logged_in(tab_page, context, target_url, theme=theme)
+                _wait_for_render(tab_page)
+                _select_tab(tab_page, extra_tab_name)
+                _wait_for_render(tab_page)
+                # Superset's DOM correctly keeps inactive tab panels
+                # display:none, but "Download as Image" force-shows every
+                # tabpanel while capturing (same as an @media print
+                # override) — so without this, the image ends up with every
+                # previously-existing tab's charts stacked on top of this
+                # one's. Ripping the hidden panels out of the DOM first
+                # means there's nothing left for it to force-show.
+                removed = tab_page.evaluate(
+                    """() => {
+                        const hidden = document.querySelectorAll('[role="tabpanel"][aria-hidden="true"]');
+                        const ids = Array.from(hidden).map(el => el.id);
+                        hidden.forEach(el => el.remove());
+                        return ids;
+                    }"""
+                )
+                log.info("Removed %d inactive tab panel(s) before capture: %s", len(removed), removed)
+                _open_download_submenu(tab_page)
+                tab_png_path = _trigger_download(
+                    tab_page, "png", UPLOAD_DIR,
+                    filename_hint=f"dashboard_{target_id}_tab_{_safe_filename(extra_tab_name)}",
+                )
+                result_files["tab_png"] = tab_png_path
+            except Exception as e:
+                log.warning("Extra tab image export failed for '%s': %s", extra_tab_name, e)
+                result_files["tab_png_error"] = str(e)
+            finally:
+                if tab_page is not None:
+                    try:
+                        tab_page.close()
+                    except Exception:
+                        pass
+
         _store_warm_page(target_url, page)
         return result_files
 
@@ -780,7 +902,7 @@ def _do_export(dashboard_id, chart_id, export_formats: list, theme="light"):
             pass
         raise
 
-def run_export_with_retry(dashboard_id, chart_id, export_formats: list, theme="light"):
+def run_export_with_retry(dashboard_id, chart_id, export_formats: list, theme="light", extra_tab_name=None):
     """
     Run _do_export with retry logic.
     On failure, resets the browser context so the next attempt starts fresh.
@@ -790,7 +912,7 @@ def run_export_with_retry(dashboard_id, chart_id, export_formats: list, theme="l
     for attempt in range(1, EXPORT_MAX_RETRIES + 2):  # attempts = retries + 1
         try:
             with _browser_lock:
-                return _do_export(dashboard_id, chart_id, export_formats, theme=theme)
+                return _do_export(dashboard_id, chart_id, export_formats, theme=theme, extra_tab_name=extra_tab_name)
 
         except Exception as exc:
             last_error = exc
@@ -817,6 +939,26 @@ def health():
         "status": "flask_up",
         "superset_running": is_superset_running(),
     })
+
+
+@app.route("/api/dashboard/<int:dashboard_id>/tabs", methods=["GET"])
+def dashboard_tabs(dashboard_id):
+    """
+    Returns the tabs available on a dashboard (id + name + order), so the
+    frontend can populate an optional "Tab" dropdown next to Dashboard ID.
+    has_tabs=false means the dashboard has no tabs — the frontend should
+    hide/disable the tab selector and the export falls back to full-dashboard.
+    """
+    try:
+        meta = _get_dashboard_tabs_meta(dashboard_id)
+        return jsonify(meta)
+    except RuntimeError as e:
+        msg = str(e)
+        status = 404 if "not found" in msg else 502
+        return jsonify({"error": msg}), status
+    except Exception as e:
+        log.error("Failed to fetch tabs for dashboard %s: %s", dashboard_id, e)
+        return jsonify({"error": f"Failed to fetch tabs: {e}"}), 500
 
 
 @app.route("/api/superset/guest-token", methods=["POST"])
@@ -860,6 +1002,11 @@ def export():
         chart_id      int   — optional; exports a single chart view
         format        str   — "pdf", "png", or "all" (default — both)
         theme         str   — "light" (default) or "dark"
+        tab_id        str   — optional; id of a tab (from
+                               GET /api/dashboard/<id>/tabs). When given, the
+                               normal dashboard export above still happens as
+                               usual (per `format`), and an EXTRA PNG image of
+                               just that one tab is included in the response.
 
     Response: application/zip
         Structure inside ZIP:
@@ -877,6 +1024,7 @@ def export():
     chart_id = body.get("chart_id")
     fmt_raw = str(body.get("format", "all")).lower()
     theme = str(body.get("theme", "light")).lower()
+    tab_id = body.get("tab_id")
 
     # --- Validate ---
     if not dashboard_id and not chart_id:
@@ -887,6 +1035,9 @@ def export():
 
     if theme not in ("light", "dark"):
         return jsonify({"error": "theme must be 'light' or 'dark'"}), 400
+
+    if tab_id and not dashboard_id:
+        return jsonify({"error": "tab_id requires dashboard_id (charts don't have tabs)"}), 400
 
     # if dashboard_id is not None and not isinstance(dashboard_id, int):
     #     return jsonify({"error": "dashboard_id must be an integer"}), 400
@@ -899,21 +1050,39 @@ def export():
     if not valid:
         return jsonify({"error": err_msg}), 404
 
+    # Resolve tab_id -> tab_name (Playwright selects tabs by their visible
+    # name, not their internal id) and confirm it actually belongs to this
+    # dashboard.
+    tab_name = None
+    if tab_id:
+        try:
+            tabs_meta = _get_dashboard_tabs_meta(dashboard_id)
+        except Exception as e:
+            return jsonify({"error": f"Could not resolve tab_id: {e}"}), 502
+
+        matched = next((t for t in tabs_meta["tabs"] if t["id"] == tab_id), None)
+        if not matched:
+            return jsonify({
+                "error": f"tab_id '{tab_id}' not found on dashboard {dashboard_id}"
+            }), 400
+        tab_name = matched["name"]
+
     export_formats = ["pdf", "png"] if fmt_raw == "all" else [fmt_raw]
 
     log.info(
-        "Export request — dashboard_id=%s chart_id=%s formats=%s theme=%s",
-        dashboard_id, chart_id, export_formats, theme,
+        "Export request — dashboard_id=%s chart_id=%s formats=%s theme=%s tab_id=%s",
+        dashboard_id, chart_id, export_formats, theme, tab_id,
     )
 
     # Run export
     # result_files = {
     #   "pdf": "/path/dashboard_28_export.pdf"          (single merged PDF)
     #   "png": { "Per Technology": "/path/Per Technology.png", ... }
+    #   "tab_png": "/path/dashboard_28_tab_Introduction.png"   (only if tab_id given)
     # }
     try:
         result_files = run_export_with_retry(
-            dashboard_id, chart_id, export_formats, theme=theme
+            dashboard_id, chart_id, export_formats, theme=theme, extra_tab_name=tab_name
         )
     except Exception as exc:
         log.error("Export failed: %s", exc)
@@ -932,6 +1101,20 @@ def export():
         png_path = list(result_files["png"].values())[0]
         # response_data["png"] = {"path": png_path}
         response_data["path"] = png_path
+
+    if "tab_png" in result_files:
+        response_data["tab"] = {
+            "id": tab_id,
+            "name": tab_name,
+            "format": "png",
+            "path": result_files["tab_png"],
+        }
+    elif "tab_png_error" in result_files:
+        response_data["tab"] = {
+            "id": tab_id,
+            "name": tab_name,
+            "error": result_files["tab_png_error"],
+        }
 
     return jsonify(response_data)
 
