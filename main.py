@@ -493,6 +493,94 @@ def _wait_for_render(page):
     page.wait_for_timeout(800)
 
 
+def _hide_scrollbars(page):
+    """
+    Inject CSS to hide scrollbars on every scrollable element before
+    "Download as Image" runs. Superset's image export (html2canvas) doesn't
+    render Chromium's overlay scrollbar thumbs correctly — they show up as
+    solid black blocks along the right edge of the exported PNG. Hiding
+    them (width/height still work; only the visual thumb is suppressed)
+    removes the artifact without affecting layout.
+    """
+    page.add_style_tag(
+        content="""
+        *{scrollbar-width:none !important;}
+        *::-webkit-scrollbar{width:0 !important;height:0 !important;display:none !important;}
+        """
+    )
+
+
+def _fit_viewport_to_content(page):
+    """
+    Widen the viewport to the dashboard's actual content width before
+    "Download as Image" captures it. The browser context opens at a fixed
+    1920x1080 viewport, but a chart row can be wider than that; when it
+    is, Superset renders it as a horizontally-scrollable carousel with a
+    semi-opaque black "scroll right" arrow pinned to the row's right
+    edge to hint there's more off-screen. Since the export capture only
+    grabs the current viewport, that arrow (and the cut-off chart behind
+    it) end up baked into the PNG as solid black blocks. Sizing the
+    viewport to scrollWidth/scrollHeight first means nothing overflows,
+    so Superset never shows the arrow and every row is captured in full.
+    """
+    try:
+        size = page.evaluate(
+            "() => ({w: document.documentElement.scrollWidth, h: document.documentElement.scrollHeight})"
+        )
+        page.set_viewport_size({"width": max(size["w"], 1920), "height": max(size["h"], 1080)})
+        page.wait_for_timeout(500)
+    except Exception as e:
+        log.warning("Could not fit viewport to content: %s", e)
+
+
+def _hide_row_hover_controls(page):
+    """
+    Remove Superset's per-row ".header-controls" buttons (the row-level
+    "..." menu used in edit mode to recolor/delete a row) before
+    "Download as Image" captures the page. They stay mounted in the DOM
+    at all times, just off-screen/invisible via hover-only CSS in view
+    mode — but Superset's own image-export routine force-shows hidden
+    UI while capturing (same as it does for inactive tabpanels, see
+    _select_tab's extra-tab capture above), which un-hides these too and
+    bakes them in as a solid black block pinned to each row's right
+    edge — exactly the blocks reported in exported PNGs. Setting
+    display:none isn't enough since that force-show routine overrides
+    it; removing the elements from the DOM means there's nothing left
+    for it to force-show. They're edit-mode-only controls, irrelevant to
+    an exported image, so removing them is safe.
+    """
+    try:
+        count = page.evaluate(
+            """
+            () => {
+                const els = document.querySelectorAll('.header-controls');
+                const n = els.length;
+                els.forEach(el => el.remove());
+                return n;
+            }
+            """
+        )
+        log.info("Removed %d row-hover control(s) before image capture.", count)
+    except Exception as e:
+        log.warning("Could not hide row-hover controls: %s", e)
+
+
+def _wait_for_icon_fonts(page):
+    """
+    Wait for all webfonts (Ant Design's icon font in particular) to finish
+    loading before the image capture fires. Superset's chart/row hover
+    icons (expand, "...", etc.) are icon-font glyphs; if the capture runs
+    before that font has loaded, each glyph paints as a solid black
+    "tofu" box instead of the icon — the black rounded blocks seen at the
+    right edge of exported PNGs, one per chart row.
+    """
+    try:
+        page.evaluate("() => document.fonts.ready")
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+
 def _open_download_submenu(page):
     """
     Open the dashboard '...' menu and hover over Download.
@@ -598,7 +686,37 @@ def _trigger_download(page, export_format, output_dir, filename_hint="export"):
     output_path = os.path.join(output_dir, filename)
     download.save_as(output_path)
     log.info("Downloaded: %s", output_path)
+
+    if export_format == "png":
+        _crop_export_artifact(page, output_path)
+
     return output_path
+
+
+def _crop_export_artifact(page, image_path):
+    """
+    Superset's "Download as Image" pads the PNG a fixed ~16px wider than
+    the actual browser viewport, with no real content in that strip (we
+    verified nothing in the DOM ever sits past the viewport edge — the
+    page never overflows horizontally). That dead strip renders as solid
+    black wherever it overlaps a chart row, showing up as black blocks
+    along the right edge of the exported image. Since content never
+    exceeds the viewport width, cropping the PNG back down to it removes
+    the artifact without losing anything real.
+    """
+    try:
+        viewport = page.viewport_size
+        if not viewport:
+            return
+        with Image.open(image_path) as img:
+            if img.width > viewport["width"]:
+                img.crop((0, 0, viewport["width"], img.height)).save(image_path)
+                log.info(
+                    "Cropped export artifact: %dpx -> %dpx wide (%s)",
+                    img.width, viewport["width"], image_path,
+                )
+    except Exception as e:
+        log.warning("Could not crop export artifact from %s: %s", image_path, e)
 
 def _safe_filename(text: str) -> str:
     """Strip characters that are unsafe in filenames."""
@@ -831,6 +949,10 @@ def _do_export(dashboard_id, chart_id, export_formats: list, theme="light", extr
 
         if "png" in export_formats:
             log.info("Triggering image download...")
+            _fit_viewport_to_content(page)
+            _hide_scrollbars(page)
+            _wait_for_icon_fonts(page)
+            _hide_row_hover_controls(page)
             _open_download_submenu(page)
             png_path = _trigger_download(
                 page, "png", UPLOAD_DIR, filename_hint=f"dashboard_{target_id}"
@@ -875,6 +997,10 @@ def _do_export(dashboard_id, chart_id, export_formats: list, theme="light", extr
                     }"""
                 )
                 log.info("Removed %d inactive tab panel(s) before capture: %s", len(removed), removed)
+                _fit_viewport_to_content(tab_page)
+                _hide_scrollbars(tab_page)
+                _wait_for_icon_fonts(tab_page)
+                _hide_row_hover_controls(tab_page)
                 _open_download_submenu(tab_page)
                 tab_png_path = _trigger_download(
                     tab_page, "png", UPLOAD_DIR,
